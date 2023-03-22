@@ -600,7 +600,8 @@ static void average_pilots(srsran_chest_dl_t*     q,
 {
   uint32_t nsymbols = (sf->sf_type == SRSRAN_SF_MBSFN) ? srsran_refsignal_mbsfn_nof_symbols(sf->subcarrier_spacing)
                                                        : srsran_refsignal_cs_nof_symbols(&q->csr_refs, sf, port_id);
-  uint32_t nref = (sf->sf_type == SRSRAN_SF_MBSFN) ? srsran_refsignal_mbsfn_rs_per_symbol(sf->subcarrier_spacing) * q->cell.nof_prb : 2 * q->cell.nof_prb;
+  uint32_t nref   = (sf->sf_type == SRSRAN_SF_MBSFN) ? SRSRAN_REFSIGNAL_NUM_SF_MBSFN(q->cell.nof_prb, sf->subcarrier_spacing) : srsran_refsignal_cs_nof_re(&q->csr_refs, sf, port_id);
+  nref /= nsymbols;
 
   // Average in the time domain if enabled
   if (cfg->estimator_alg == SRSRAN_ESTIMATOR_ALG_AVERAGE && nsymbols > 1) {
@@ -650,16 +651,13 @@ static float chest_dl_rssi(srsran_chest_dl_t* q, srsran_dl_sf_cfg_t* sf, cf_t* i
 
 // CFO estimation algorithm taken from "Carrier Frequency Synchronization in the
 // Downlink of 3GPP LTE", Qi Wang, C. Mehlfuhrer, M. Rupp
-static float chest_estimate_cfo(srsran_chest_dl_t* q)
+static float chest_estimate_cfo(srsran_chest_dl_t* q, srsran_dl_sf_cfg_t* sf)
 {
   float n  = (float)srsran_symbol_sz(q->cell.nof_prb);
   float ns = (float)SRSRAN_CP_NSYMB(q->cell.cp);
-  float ng = (float)SRSRAN_CP_LEN_NORM(1, n);
+  float ng = SRSRAN_CP_ISNORM(q->cell.cp) ? (float)SRSRAN_CP_LEN_NORM(1, n) : (float)SRSRAN_CP_LEN_EXT(n);
 
-  srsran_dl_sf_cfg_t sf_cfg;
-  ZERO_OBJECT(sf_cfg);
-
-  uint32_t npilots = srsran_refsignal_cs_nof_re(&q->csr_refs, &sf_cfg, 0);
+  uint32_t npilots = srsran_refsignal_cs_nof_re(&q->csr_refs, sf, 0);
 
   // Compute angles between slots
   for (int i = 0; i < 2; i++) {
@@ -672,7 +670,7 @@ static float chest_estimate_cfo(srsran_chest_dl_t* q)
   cf_t sum = srsran_vec_acc_cc(q->tmp_cfo_estimate, npilots / 2);
 
   // Compute CFO
-  return -cargf(sum) * n / (ns * (n + ng)) / 2 / M_PI;
+  return -cargf(sum) * n / (ns * (n + ng)) * 2 * M_PI;
 }
 
 static void chest_interpolate_noise_est(srsran_chest_dl_t*     q,
@@ -689,7 +687,7 @@ static void chest_interpolate_noise_est(srsran_chest_dl_t*     q,
   srsran_sf_t ch_mode    = sf->sf_type;
 
   if (cfg->cfo_estimate_enable && ((1 << sf_idx) & cfg->cfo_estimate_sf_mask) && ch_mode != SRSRAN_SF_MBSFN) {
-    q->cfo = chest_estimate_cfo(q);
+    q->cfo = chest_estimate_cfo(q, sf);
   }
 
   /* Estimate noise */
@@ -783,25 +781,43 @@ static void chest_interpolate_noise_est(srsran_chest_dl_t*     q,
 }
 
 static void
-chest_dl_estimate_correct_sync_error(srsran_chest_dl_t* q, srsran_dl_sf_cfg_t* sf, cf_t* input, uint32_t rxant_id)
+chest_dl_estimate_correct_sync_error(srsran_chest_dl_t* q, 
+                                    srsran_dl_sf_cfg_t* sf, 
+                                    srsran_chest_dl_cfg_t* cfg,
+                                    cf_t* input, 
+                                    uint32_t rxant_id)
 {
+  srsran_sf_t ch_mode   = sf->sf_type;
   float pwr_sum  = 0.0f;
   float sync_err = 0.0f;
+  uint32_t      sf_idx        = sf->tti % 10;
+  uint16_t      mbsfn_area_id = cfg->mbsfn_area_id;
+  uint8_t       symbol_offset = 0;
 
   // For each cell port...
   for (uint32_t cell_port_id = 0; cell_port_id < q->cell.nof_ports; cell_port_id++) {
-    uint32_t npilots = srsran_refsignal_cs_nof_re(&q->csr_refs, sf, cell_port_id);
-    uint32_t nsymb   = srsran_refsignal_cs_nof_symbols(&q->csr_refs, sf, cell_port_id);
+    uint32_t npilots = (ch_mode == SRSRAN_SF_MBSFN) ? SRSRAN_REFSIGNAL_NUM_SF_MBSFN(q->cell.nof_prb, sf->subcarrier_spacing) : srsran_refsignal_cs_nof_re(&q->csr_refs, sf, cell_port_id);
+    uint32_t nsymb   = (ch_mode == SRSRAN_SF_MBSFN) ? srsran_refsignal_mbsfn_nof_symbols() + (sf->subcarrier_spacing == SRSRAN_SCS_15KHZ ? 1 : 0) : srsran_refsignal_cs_nof_symbols(&q->csr_refs, sf, cell_port_id);
 
-    // Get references from the input signal
-    srsran_refsignal_cs_get_sf(&q->csr_refs, sf, cell_port_id, input, q->pilot_recv_signal);
+    if (ch_mode == SRSRAN_SF_MBSFN) {
+      // Get references from the input signal
+      srsran_refsignal_cs_get_sf(&q->csr_refs, sf, cell_port_id, input, q->pilot_recv_signal);
 
-    // Use the known CSR signal to compute Least-squares estimates
-    srsran_vec_prod_conj_ccc(
-        q->pilot_recv_signal, q->csr_refs.pilots[cell_port_id / 2][sf->tti % 10], q->pilot_estimates, npilots);
+      // Use the known CSR signal to compute Least-squares estimates
+      srsran_vec_prod_conj_ccc(
+          q->pilot_recv_signal, q->csr_refs.pilots[cell_port_id / 2][sf->tti % 10], q->pilot_estimates, npilots);
+    } else {
+      // Get references from the input signal
+      srsran_refsignal_mbsfn_get_sf(q->cell, cell_port_id, input, q->pilot_recv_signal, sf->subcarrier_spacing, sf_idx);
+      
+      srsran_vec_prod_conj_ccc(&q->pilot_recv_signal[(symbol_offset * q->cell.nof_prb)],
+          q->mbsfn_refs[mbsfn_area_id]->pilots[cell_port_id / 2][sf_idx],
+          &q->pilot_estimates[(symbol_offset * q->cell.nof_prb)],
+          SRSRAN_REFSIGNAL_NUM_SF_MBSFN(q->cell.nof_prb, sf->subcarrier_spacing) - (symbol_offset * q->cell.nof_prb));
+    }
 
     // Estimate synchronization error from the phase shift
-    float k   = (float)srsran_symbol_sz(q->cell.nof_prb) / 6.0f;
+    float k   = (float)srsran_symbol_sz_scs(q->cell.nof_prb, sf->subcarrier_spacing)/ 6; 
     float sum = 0.0f;
     for (uint32_t i = 0; i < nsymb; i++) {
       sum += srsran_vec_estimate_frequency(q->pilot_estimates + i * npilots / nsymb, npilots / nsymb) * k;
@@ -826,9 +842,9 @@ chest_dl_estimate_correct_sync_error(srsran_chest_dl_t* q, srsran_dl_sf_cfg_t* s
   // Correct time synchronization error if estimated is not NAN, not INF and greater than 0.05 samples
   if (isnormal(sync_err) && fabsf(sync_err) > 0.05f) {
     // Compute required frequency shift, convert from sample error to normalised sine
-    float    cfo   = sync_err / (float)srsran_symbol_sz(q->cell.nof_prb);
-    uint32_t nre   = SRSRAN_NRE * q->cell.nof_prb;
-    uint32_t nsymb = SRSRAN_CP_NSYMB(q->cell.cp) * SRSRAN_NOF_SLOTS_PER_SF;
+    float    cfo   = sync_err / (float)srsran_symbol_sz_scs(q->cell.nof_prb, sf->subcarrier_spacing);
+    uint32_t nre   = SRSRAN_NRE_SCS(sf->subcarrier_spacing) * q->cell.nof_prb;
+    uint32_t nsymb = SRSRAN_MBSFN_NOF_SYMBOLS(sf->subcarrier_spacing) * SRSRAN_MBSFN_NOF_SLOTS(sf->subcarrier_spacing);
 
     // For each symbol...
     for (uint32_t i = 0; i < nsymb; i++) {
@@ -1046,7 +1062,7 @@ int srsran_chest_dl_estimate_cfg(srsran_chest_dl_t*     q,
   for (uint32_t rxant_id = 0; rxant_id < q->nof_rx_antennas; rxant_id++) {
     // Estimate and correct synchronization error if enabled
     if (cfg->sync_error_enable) {
-      chest_dl_estimate_correct_sync_error(q, sf, input[rxant_id], rxant_id);
+      chest_dl_estimate_correct_sync_error(q, sf, cfg, input[rxant_id], rxant_id);
     }
 
     for (uint32_t port_id = 0; port_id < q->cell.nof_ports; port_id++) {
